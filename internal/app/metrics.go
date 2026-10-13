@@ -1,6 +1,9 @@
 package app
 
 import (
+	"time"
+
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -35,7 +38,7 @@ var (
 	batchDelayHist = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: "kahouse",
 		Name:      "batch_delay_seconds",
-		Help:      "Age of the oldest message in a batch at flush time (wall-clock time from first message arrival to flush)",
+		Help:      "Wall-clock time from the first message's arrival in the batch to flush. Not the message's age since it was produced: see record_receive_lag_seconds",
 		Buckets:   prometheus.ExponentialBuckets(0.01, 2, 10),
 	}, []string{"topic"})
 	processLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -43,6 +46,13 @@ var (
 		Name:      "process_latency_seconds",
 		Help:      "Time spent writing a batch to ClickHouse (includes retry backoff)",
 		Buckets:   prometheus.ExponentialBuckets(0.01, 2, 10),
+	}, []string{"topic"})
+	// A summary without quantiles exports only _sum and _count: the mean over
+	// any window is sum/count, at two series per topic.
+	recordReceiveLag = prometheus.NewSummaryVec(prometheus.SummaryOpts{
+		Namespace: "kahouse",
+		Name:      "record_receive_lag_seconds",
+		Help:      "Time from a message's Kafka timestamp to its read by the sink task",
 	}, []string{"topic"})
 	retryCountHist = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: "kahouse",
@@ -86,6 +96,7 @@ func init() {
 		batchSizeHist,
 		batchDelayHist,
 		processLatency,
+		recordReceiveLag,
 		retryCountHist,
 		taskStopped,
 		taskRestartsTotal,
@@ -93,4 +104,13 @@ func init() {
 		taskRecycleEscalationsTotal,
 		startAtAppliedTotal,
 	)
+}
+
+// observeReceiveLag records how long after its Kafka timestamp a message was
+// read. Messages without a timestamp are skipped.
+func observeReceiveLag(topic string, msg *kafka.Message, now time.Time) {
+	if msg.TimestampType == kafka.TimestampNotAvailable {
+		return
+	}
+	recordReceiveLag.WithLabelValues(topic).Observe(now.Sub(msg.Timestamp).Seconds())
 }

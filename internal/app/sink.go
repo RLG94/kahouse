@@ -342,6 +342,7 @@ func (t *SinkTask) Run(ctx context.Context) {
 		}
 
 		msgConsumed.WithLabelValues(topic).Inc()
+		observeReceiveLag(topic, msg, time.Now())
 
 		// Tombstone (null-value) message: commit offset and skip.
 		if len(msg.Value) == 0 {

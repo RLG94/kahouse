@@ -216,9 +216,10 @@ All metrics are labeled by `topic`.
 | `kahouse_task_auto_restarts_total` | Counter | Supervisor auto-restarts of transiently-crashed tasks |
 | `kahouse_task_recycle_escalations_total` | Counter | Times the supervisor gave up and escalated to a pod recycle via `/livez` |
 | `kahouse_batch_size` | Histogram | Records per flushed batch |
-| `kahouse_batch_delay_seconds` | Histogram | Age of oldest record in batch at flush time |
+| `kahouse_batch_delay_seconds` | Histogram | Time from the first record's arrival in the batch to flush |
 | `kahouse_process_latency_seconds` | Histogram | ClickHouse write duration (includes retries) |
 | `kahouse_write_retry_count` | Histogram | Retry attempts per batch write |
+| `kahouse_record_receive_lag_seconds` | Summary | Time from a record's Kafka timestamp to its read; `_sum / _count` gives the mean |
 
 ## Testing
 
