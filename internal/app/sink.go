@@ -108,6 +108,7 @@ type SinkTask struct {
 	metadataMapping               *KafkaMetadataMapping
 	metadataCollisionWarnedFields sync.Map // key: column name (string), value: struct{}
 	columnInfo                    ColumnInfo
+	startedAt                     time.Time // when this task was created; readiness grants new tasks a grace window
 }
 
 func (t *SinkTask) IsStopped() bool {
@@ -155,6 +156,12 @@ func (t *SinkTask) NeedsRecycle() bool {
 
 func (t *SinkTask) TopicName() string {
 	return t.mapping.Topic
+}
+
+// StartedAt reports when the task was created. Readiness uses it to tolerate the
+// few seconds a fresh consumer needs to join its group and receive partitions.
+func (t *SinkTask) StartedAt() time.Time {
+	return t.startedAt
 }
 
 func (t *SinkTask) Assignment() ([]kafka.TopicPartition, error) {
@@ -220,6 +227,7 @@ func NewSinkTask(
 		startAt:            mapping.StartAt,
 		metadataMapping:    resolveMetadataMapping(mapping.KafkaMetadata),
 		columnInfo:         columnInfo,
+		startedAt:          time.Now(),
 	}
 
 	if err := consumer.Subscribe(mapping.Topic, task.onRebalance); err != nil {

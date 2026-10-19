@@ -133,8 +133,8 @@ func TestTaskManagerTopicsSurfacesSkippedTables(t *testing.T) {
 		tasks:     make(map[string]*managedTask),
 		parentCtx: ctx,
 		logger:    zap.NewNop().Sugar(),
-		skippedTables: []TopicTableMapping{
-			{Topic: "orders", Table: "default.orders"},
+		skippedTables: map[string]TopicTableMapping{
+			"orders": {Topic: "orders", Table: "default.orders"},
 		},
 	}
 	mgr.tasks["payments"] = &managedTask{
@@ -154,6 +154,9 @@ func TestTaskManagerTopicsSurfacesSkippedTables(t *testing.T) {
 	}
 	if skipped.Status != "stopped" || skipped.StopReason != "table_missing" {
 		t.Fatalf("Expected orders stopped/table_missing, got %q/%q", skipped.Status, skipped.StopReason)
+	}
+	if skipped.Source != "config" || skipped.Pattern != "" {
+		t.Fatalf("Expected an explicit topic to report source=config, got %+v", skipped)
 	}
 
 	// A skipped table must NOT appear in the health snapshot, so readiness ignores it.

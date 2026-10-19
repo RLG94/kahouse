@@ -85,6 +85,21 @@ var (
 		Name:      "start_at_applied_total",
 		Help:      "Per-partition starting position decisions made on assignment. Labels: topic, decision (committed | start_at_offset | start_at_timestamp | start_at_position | fallback_auto_reset).",
 	}, []string{"topic", "decision"})
+	discoveredTopics = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "kahouse",
+		Name:      "discovered_topics",
+		Help:      "Topics currently managed from a topic_patterns entry (running, stopped, or parked as table_missing)",
+	}, []string{"pattern"})
+	discoveryErrorsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "kahouse",
+		Name:      "discovery_errors_total",
+		Help:      "Discovery ticks whose Kafka topic listing failed; pattern reconciliation is skipped for that tick",
+	})
+	discoveryTopicsRemovedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "kahouse",
+		Name:      "discovery_topics_removed_total",
+		Help:      "Pattern-discovered sink tasks removed because their topic disappeared from Kafka",
+	}, []string{"pattern"})
 )
 
 func init() {
@@ -103,6 +118,9 @@ func init() {
 		taskAutoRestartsTotal,
 		taskRecycleEscalationsTotal,
 		startAtAppliedTotal,
+		discoveredTopics,
+		discoveryErrorsTotal,
+		discoveryTopicsRemovedTotal,
 	)
 }
 

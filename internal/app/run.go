@@ -104,7 +104,10 @@ func Run() {
 
 	tableColumns := validateTables(context.Background(), chConn, cfg.TopicTables, sugar)
 	if len(tableColumns) == 0 {
-		sugar.Fatal("No target tables validated; refusing to start with zero sink tasks")
+		if len(cfg.TopicPatterns) == 0 {
+			sugar.Fatal("No target tables validated; refusing to start with zero sink tasks")
+		}
+		sugar.Warn("No explicit target tables validated; sink tasks will come from topic_patterns discovery")
 	}
 
 	// Shared DLQ producer
@@ -127,18 +130,47 @@ func Run() {
 
 	validateDLQTopics(dlqProducer, cfg, sugar)
 
+	// Topic listing for topic_patterns discovery, sharing the DLQ producer's handle.
+	var lister topicLister
+	if len(cfg.TopicPatterns) > 0 {
+		adminClient, err := kafka.NewAdminClientFromProducer(dlqProducer)
+		if err != nil {
+			sugar.Errorf("Failed to create Kafka admin client for topic discovery: %v", err)
+			return
+		}
+		defer adminClient.Close()
+		lister = &kafkaTopicLister{admin: adminClient, timeout: time.Duration(cfg.TopicDiscovery.TimeoutMs) * time.Millisecond}
+	}
+
 	// Create and start the task manager
-	mgr := NewTaskManager(ctx, cfg, chConn, srClient, dlqProducer, sugar, tableColumns)
+	mgr := NewTaskManager(ctx, cfg, chConn, srClient, dlqProducer, sugar, tableColumns, lister)
 	if err := mgr.StartAll(); err != nil {
 		sugar.Errorf("Failed to start sink tasks: %v", err)
 		return
+	}
+
+	// The first discovery tick runs synchronously so pattern-matched topics start
+	// alongside the explicit ones. A listing failure is logged inside Reconcile and
+	// retried by the loop; it must not keep the explicit topics from running.
+	res := mgr.Reconcile(ctx)
+	sugar.Infow("Initial topic discovery completed",
+		"listed", res.Listed,
+		"started", res.Started,
+		"table_missing", res.TableMissing,
+		"list_error", res.ListError,
+	)
+	if interval := *cfg.TopicDiscovery.IntervalS; interval > 0 {
+		go mgr.RunDiscovery(ctx, time.Duration(interval)*time.Second)
 	}
 
 	// Start metrics, health, and admin server. If it fails to bind (e.g. port conflict),
 	// cancel the context so the process exits cleanly rather than running without observability.
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	health := NewHealth(sugar, chConn, mgr.Snapshot)
+	health := NewHealth(sugar, chConn, mgr.Snapshot, HealthOptions{
+		AllowNoTasks:   len(cfg.TopicPatterns) > 0,
+		ReadinessGrace: time.Duration(*cfg.ReadinessGraceS) * time.Second,
+	})
 	RegisterHealthEndpoints(health, mux)
 	RegisterAdminEndpoints(mgr, mux)
 

@@ -17,7 +17,22 @@ type sinkHealthChecker interface {
 	StoppedByOperator() bool
 	NeedsRecycle() bool
 	TopicName() string
+	StartedAt() time.Time
 	Assignment() ([]kafka.TopicPartition, error)
+}
+
+// HealthOptions tunes how liveness and readiness interpret the task set.
+type HealthOptions struct {
+	// AllowNoTasks makes an empty task set healthy instead of a misconfiguration.
+	// Set when topic_patterns are configured: a deployment may legitimately have
+	// no matching topic yet.
+	AllowNoTasks bool
+	// ReadinessGrace is how long after launch a running task may have no
+	// partition assignment without failing /readyz. Joining a consumer group
+	// takes a few seconds (group.initial.rebalance.delay.ms defaults to 3s), and
+	// discovered topics spawn tasks at any time; without the grace every new
+	// topic would flap readiness for the whole pod. Zero disables it.
+	ReadinessGrace time.Duration
 }
 
 // Health contains health check state
@@ -25,16 +40,19 @@ type Health struct {
 	logger *zap.SugaredLogger
 	ping   func(context.Context) error
 	tasks  func() []sinkHealthChecker
+	opts   HealthOptions
 }
 
 // NewHealth creates a new Health checker.
 // The tasks function is called on each health check to get a live snapshot,
-// supporting dynamic task management (tasks may be stopped and restarted at runtime).
-func NewHealth(logger *zap.SugaredLogger, chConn driver.Conn, tasks func() []sinkHealthChecker) *Health {
+// supporting dynamic task management (tasks may be stopped, restarted, discovered
+// and removed at runtime).
+func NewHealth(logger *zap.SugaredLogger, chConn driver.Conn, tasks func() []sinkHealthChecker, opts HealthOptions) *Health {
 	return &Health{
 		logger: logger,
 		ping:   chConn.Ping,
 		tasks:  tasks,
+		opts:   opts,
 	}
 }
 
@@ -64,11 +82,12 @@ func (h *Health) Livez(w http.ResponseWriter, r *http.Request) {
 
 // livenessShouldFail returns true when every registered task is stopped and at
 // least one of those stops was unexpected. An empty task set also fails liveness,
-// since a process with no tasks configured is misconfigured.
+// since a process with no tasks configured is misconfigured, unless
+// AllowNoTasks is set because topic_patterns may still discover some.
 func (h *Health) livenessShouldFail() bool {
 	tasks := h.tasks()
 	if len(tasks) == 0 {
-		return true
+		return !h.opts.AllowNoTasks
 	}
 	allStopped := true
 	anyCrashed := false
@@ -114,7 +133,7 @@ func (h *Health) readinessError(ctx context.Context) error {
 	}
 
 	tasks := h.tasks()
-	if len(tasks) == 0 {
+	if len(tasks) == 0 && !h.opts.AllowNoTasks {
 		return fmt.Errorf("no sink tasks configured")
 	}
 
@@ -128,6 +147,9 @@ func (h *Health) readinessError(ctx context.Context) error {
 			return fmt.Errorf("sink task for topic %q assignment check failed: %w", topic, err)
 		}
 		if len(assignment) == 0 {
+			if h.opts.ReadinessGrace > 0 && time.Since(task.StartedAt()) < h.opts.ReadinessGrace {
+				continue // still joining its consumer group
+			}
 			return fmt.Errorf("sink task for topic %q has no partition assignment", topic)
 		}
 	}

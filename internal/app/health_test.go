@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/prometheus/client_golang/prometheus"
@@ -18,6 +19,7 @@ type stubSinkChecker struct {
 	stoppedByOperator bool
 	needsRecycle      bool
 	topic             string
+	startedAt         time.Time
 	assignment        []kafka.TopicPartition
 	err               error
 }
@@ -26,7 +28,81 @@ func (s stubSinkChecker) IsStopped() bool                             { return s
 func (s stubSinkChecker) StoppedByOperator() bool                     { return s.stoppedByOperator }
 func (s stubSinkChecker) NeedsRecycle() bool                          { return s.needsRecycle }
 func (s stubSinkChecker) TopicName() string                           { return s.topic }
+func (s stubSinkChecker) StartedAt() time.Time                        { return s.startedAt }
 func (s stubSinkChecker) Assignment() ([]kafka.TopicPartition, error) { return s.assignment, s.err }
+
+func TestHealthAllowNoTasks(t *testing.T) {
+	health := &Health{
+		logger: zap.NewNop().Sugar(),
+		ping:   func(context.Context) error { return nil },
+		tasks:  func() []sinkHealthChecker { return nil },
+		opts:   HealthOptions{AllowNoTasks: true},
+	}
+
+	rr := httptest.NewRecorder()
+	health.Livez(rr, httptest.NewRequest("GET", "/livez", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("Expected /livez 200 with no tasks when patterns may discover some, got %d", rr.Code)
+	}
+	if err := health.readinessError(context.Background()); err != nil {
+		t.Fatalf("Expected readiness success with no tasks, got %v", err)
+	}
+}
+
+func TestHealthReadinessGrace(t *testing.T) {
+	tests := []struct {
+		name  string
+		grace time.Duration
+		task  stubSinkChecker
+		want  string
+	}{
+		{
+			name:  "fresh task still joining its group passes",
+			grace: 30 * time.Second,
+			task:  stubSinkChecker{topic: "orders", startedAt: time.Now()},
+			want:  "",
+		},
+		{
+			name:  "old task without assignment fails",
+			grace: 30 * time.Second,
+			task:  stubSinkChecker{topic: "orders", startedAt: time.Now().Add(-time.Minute)},
+			want:  `sink task for topic "orders" has no partition assignment`,
+		},
+		{
+			name:  "grace never covers a stopped task",
+			grace: 30 * time.Second,
+			task:  stubSinkChecker{topic: "orders", startedAt: time.Now(), stopped: true},
+			want:  `sink task for topic "orders" has stopped`,
+		},
+		{
+			name:  "zero grace restores strict behavior",
+			grace: 0,
+			task:  stubSinkChecker{topic: "orders", startedAt: time.Now()},
+			want:  `sink task for topic "orders" has no partition assignment`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			health := &Health{
+				logger: zap.NewNop().Sugar(),
+				ping:   func(context.Context) error { return nil },
+				tasks:  func() []sinkHealthChecker { return []sinkHealthChecker{tt.task} },
+				opts:   HealthOptions{ReadinessGrace: tt.grace},
+			}
+			err := health.readinessError(context.Background())
+			if tt.want == "" {
+				if err != nil {
+					t.Fatalf("Expected readiness success, got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Expected error containing %q, got %v", tt.want, err)
+			}
+		})
+	}
+}
 
 func TestHealthReadinessError(t *testing.T) {
 	tests := []struct {

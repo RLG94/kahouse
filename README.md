@@ -29,6 +29,8 @@ graph LR
 
 Each topic gets its own sink task running a single loop: read a message, decode it, append it to a batch, and flush to ClickHouse when a size or time threshold is reached. A failure in one topic stops only that task, the others keep running. Stopped topics can be restarted via the [admin API](#admin-api) without redeploying.
 
+Topics can be listed explicitly or matched by regex ([topic patterns](#topic-patterns)): new topics that follow a naming convention are discovered at runtime and get their own isolated task, with no config change or redeploy.
+
 Delivery is **at-least-once**. Offsets are committed only after a batch is successfully written to ClickHouse. On restart, some records may be re-delivered. Deduplication is your responsibility (e.g. `ReplacingMergeTree` with an application-level key).
 
 ## Quick start
@@ -74,6 +76,37 @@ topic_tables:
 ```
 
 See `config.yaml.example` for a full annotated example.
+
+### Topic patterns
+
+Instead of listing every topic, match them with a regex and derive the table name from the topic. kahouse lists the cluster's topics at startup and every `topic_discovery.interval_s` (default 60s). Every new match gets its own sink task, consumer and consumer group, exactly like an explicit entry, so a failure in one discovered topic never touches the others.
+
+```yaml
+topic_patterns:
+  - pattern: "prod\\.(?P<domain>[a-z]+)\\.(?P<entity>[a-z_]+)"
+    table: "analytics.${domain}_${entity}"   # prod.hr.employees -> analytics.hr_employees
+    format: "json"                            # same per-topic overrides as topic_tables
+    start_at:
+      position: earliest
+
+  - pattern: "cdc\\.public\\.(.+)"
+    table: "raw.${1}"                         # cdc.public.invoices -> raw.invoices
+
+  - pattern: "events\\..*"
+    table: "raw.${0}"                         # ${0} is the whole topic name
+    table_replace: {".": "_"}                 # events.user.signup -> raw.events_user_signup
+
+topic_discovery:
+  interval_s: 60                              # 0 disables the loop (patterns still expand at startup)
+  max_topics: 200                             # cap on discovered tasks, each one is a full Kafka consumer
+```
+
+- Patterns match the whole topic name (`events` does not match `events.dlq`). Topics starting with `_` (`__consumer_offsets`, `_schemas`, ...) and topics ending in `dlq_topic_suffix` are never matched.
+- An explicit `topic_tables` entry always wins over a pattern, so per-topic overrides keep working. If several patterns match, the first in config order wins and a warning is logged.
+- `table` is a template: `${0}` is the full topic, `${1}` a numbered group, `${name}` a named group, `$$` a literal dollar. References are validated at startup. `table_replace` rewrites substrings inside the captured groups before expansion.
+- A matched topic whose table does not exist yet shows up as `stopped/table_missing` in the [admin API](#admin-api) and starts on its own once the table is created.
+- A discovered topic that disappears from Kafka for two consecutive ticks has its task stopped and removed. If the topic comes back it is picked up again.
+- `POST /api/discovery/run` triggers a tick immediately instead of waiting for the interval.
 
 ## ClickHouse
 
@@ -166,8 +199,8 @@ Default port is `9090` (configurable via `metrics_port`).
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /livez` | Returns 200 unless (a) the supervisor flagged a task for recycle after exhausting auto-restart, or (b) every task has stopped AND at least one stopped unexpectedly. Operator-initiated stops (admin API stop/restart, SIGTERM) keep `/livez` at 200, so kubelet does not kill the pod during maintenance or graceful shutdown. A single transient crash does not fail `/livez` — the supervisor restarts it in place. |
-| `GET /readyz` | Returns 200 if ClickHouse is reachable and all consumers have partition assignments (so a task stopped or crash-looping makes the pod NotReady) |
+| `GET /livez` | Returns 200 unless (a) the supervisor flagged a task for recycle after exhausting auto-restart, or (b) every task has stopped AND at least one stopped unexpectedly. Operator-initiated stops (admin API stop/restart, SIGTERM) keep `/livez` at 200, so kubelet does not kill the pod during maintenance or graceful shutdown. A single transient crash does not fail `/livez` — the supervisor restarts it in place. With `topic_patterns` configured, having no tasks yet is a valid state. |
+| `GET /readyz` | Returns 200 if ClickHouse is reachable and all consumers have partition assignments (so a task stopped or crash-looping makes the pod NotReady). Tasks younger than `readiness_grace_s` (default 30s) may still be joining their consumer group and are not held against readiness. With `topic_patterns` configured, zero tasks is Ready, so alert on `kahouse_discovery_errors_total` to catch a listing that keeps failing. |
 | `GET /metrics` | Prometheus metrics |
 
 ### Admin API
@@ -182,14 +215,21 @@ Operational endpoints for managing individual topics at runtime.
 | `POST /api/topics/{topic}/restart` | Stop and start a topic |
 | `POST /api/topics/{topic}/repair` | Enable repair mode: `{"mode":"dlq"}` or `{"mode":"skip"}` |
 | `DELETE /api/topics/{topic}/repair` | Disable repair mode |
+| `POST /api/discovery/run` | Run a [topic discovery](#topic-patterns) tick now; returns what was started, parked or removed |
 
 ```bash
 # Check which topics are running
 curl http://localhost:9090/api/topics
-# -> [{"topic":"orders","table":"default.orders","status":"stopped","stop_reason":"crash","stop_class":"transient","repair_mode":""}, ...]
+# -> [{"topic":"orders","table":"default.orders","source":"config","status":"stopped","stop_reason":"crash","stop_class":"transient","repair_mode":""},
+#     {"topic":"prod.hr.leaves","table":"analytics.hr_leaves","source":"pattern","pattern":"prod\\.(?P<domain>[a-z]+)\\.(?P<entity>[a-z_]+)","status":"running","stop_reason":"","stop_class":"","repair_mode":""}, ...]
+# source is "config" (topic_tables) or "pattern" (discovered via topic_patterns, with the matching pattern).
 # stop_reason is "operator" (admin API stop/restart or SIGTERM), "crash" (unexpected exit),
-#   "table_missing" (configured but never started because its target table did not validate), or "" (running).
+#   "table_missing" (matched or configured but not started because its target table does not exist yet), or "" (running).
 # stop_class refines a crash: "transient" (auto-restart eligible) or "fatal" (needs an operator); "" otherwise.
+
+# Pick up a topic or table you just created without waiting for the next tick
+curl -X POST http://localhost:9090/api/discovery/run
+# -> {"listed":42,"started":["prod.hr.leaves"],"table_missing":[],"removed":[]}
 
 # Start a stopped topic
 curl -X POST http://localhost:9090/api/topics/orders/start
@@ -203,7 +243,7 @@ curl -X DELETE http://localhost:9090/api/topics/orders/repair
 
 ### Prometheus metrics
 
-All metrics are labeled by `topic`.
+All metrics are labeled by `topic`, except the discovery metrics, which are labeled by `pattern`.
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -220,6 +260,9 @@ All metrics are labeled by `topic`.
 | `kahouse_process_latency_seconds` | Histogram | ClickHouse write duration (includes retries) |
 | `kahouse_write_retry_count` | Histogram | Retry attempts per batch write |
 | `kahouse_record_receive_lag_seconds` | Summary | Time from a record's Kafka timestamp to its read; `_sum / _count` gives the mean |
+| `kahouse_discovered_topics` | Gauge | Topics currently managed per `pattern` (running, stopped, or parked as `table_missing`) |
+| `kahouse_discovery_errors_total` | Counter | Discovery ticks whose Kafka topic listing failed. A pattern-only deployment stays Ready with zero tasks while this keeps increasing, so alert on it |
+| `kahouse_discovery_topics_removed_total` | Counter | Discovered tasks removed per `pattern` because their topic disappeared from Kafka |
 
 ## Testing
 

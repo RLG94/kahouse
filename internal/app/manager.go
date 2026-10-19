@@ -35,10 +35,20 @@ type restartTracker struct {
 type TopicStatus struct {
 	Topic      string `json:"topic"`
 	Table      string `json:"table"`
-	Status     string `json:"status"`      // "running" or "stopped"
-	StopReason string `json:"stop_reason"` // "", "operator", "crash", or "table_missing"
-	StopClass  string `json:"stop_class"`  // "", "transient", or "fatal" (only set for crashes)
-	RepairMode string `json:"repair_mode"` // "", "dlq", or "skip"
+	Source     string `json:"source"`            // "config" (topic_tables) or "pattern" (topic_patterns)
+	Pattern    string `json:"pattern,omitempty"` // the topic_patterns entry that produced the topic
+	Status     string `json:"status"`            // "running" or "stopped"
+	StopReason string `json:"stop_reason"`       // "", "operator", "crash", or "table_missing"
+	StopClass  string `json:"stop_class"`        // "", "transient", or "fatal" (only set for crashes)
+	RepairMode string `json:"repair_mode"`       // "", "dlq", or "skip"
+}
+
+// topicSource names where a mapping came from for the admin API.
+func topicSource(mapping TopicTableMapping) string {
+	if mapping.SourcePattern != "" {
+		return "pattern"
+	}
+	return "config"
 }
 
 // TaskManager launches configured tasks, monitors their state, and provides an HTTP
@@ -56,16 +66,28 @@ type TaskManager struct {
 	dlqProducer  *kafka.Producer
 	logger       *zap.SugaredLogger
 	parentCtx    context.Context
-	tableColumns TableColumns
-	// skippedTables holds topics that were not started because their target table
-	// failed validation. They never enter tasks (so health/readiness ignore them),
-	// but the admin API surfaces them as stopped/table_missing so a configured-but-
-	// not-syncing table is visible instead of silently dropped.
-	skippedTables []TopicTableMapping
+	tableColumns TableColumns // guarded by mu: the discovery loop adds tables at runtime
+	// skippedTables holds topics (keyed by name) that were not started because
+	// their target table failed validation. They never enter tasks (so
+	// health/readiness ignore them), but the admin API surfaces them as
+	// stopped/table_missing so a configured-but-not-syncing table is visible
+	// instead of silently dropped. The discovery loop re-checks them every tick
+	// and starts them once the table exists.
+	skippedTables map[string]TopicTableMapping
+
+	// Topic discovery state (see discovery.go).
+	lister           topicLister                                       // nil when topic_patterns is empty
+	describeTable    func(context.Context, string) (ColumnInfo, error) // ClickHouse DESCRIBE; swappable in tests
+	startTaskFn      func(TopicTableMapping) error                     // startTask; swappable in tests
+	discoveryMu      sync.Mutex                                        // serialises Reconcile (ticker vs admin trigger)
+	patternMisses    map[string]int                                    // consecutive listings a pattern task's topic was absent
+	multiMatchWarned map[string]struct{}                               // topics already warned about matching several patterns
 }
 
 // NewTaskManager creates a TaskManager bound to the given parent context.
 // The parent context controls the overall process lifetime; cancelling it stops all tasks.
+// lister may be nil when no topic_patterns are configured; the discovery loop then
+// only retries topics parked as table_missing.
 func NewTaskManager(
 	ctx context.Context,
 	cfg *Config,
@@ -74,18 +96,28 @@ func NewTaskManager(
 	dlqProducer *kafka.Producer,
 	logger *zap.SugaredLogger,
 	tableColumns TableColumns,
+	lister topicLister,
 ) *TaskManager {
-	return &TaskManager{
-		tasks:        make(map[string]*managedTask),
-		restart:      make(map[string]*restartTracker),
-		cfg:          cfg,
-		chConn:       chConn,
-		srClient:     srClient,
-		dlqProducer:  dlqProducer,
-		logger:       logger,
-		parentCtx:    ctx,
-		tableColumns: tableColumns,
+	m := &TaskManager{
+		tasks:            make(map[string]*managedTask),
+		restart:          make(map[string]*restartTracker),
+		cfg:              cfg,
+		chConn:           chConn,
+		srClient:         srClient,
+		dlqProducer:      dlqProducer,
+		logger:           logger,
+		parentCtx:        ctx,
+		tableColumns:     tableColumns,
+		skippedTables:    make(map[string]TopicTableMapping),
+		lister:           lister,
+		patternMisses:    make(map[string]int),
+		multiMatchWarned: make(map[string]struct{}),
 	}
+	m.describeTable = func(ctx context.Context, table string) (ColumnInfo, error) {
+		return getTableColumns(ctx, chConn, table)
+	}
+	m.startTaskFn = m.startTask
+	return m
 }
 
 // StartAll launches a SinkTask for every topic-table mapping in the config.
@@ -93,7 +125,7 @@ func (m *TaskManager) StartAll() error {
 	for _, mapping := range m.cfg.TopicTables {
 		if _, ok := m.tableColumns[mapping.Table]; !ok {
 			m.logger.Warnf("Skipping sink task for topic %s: table %q did not validate", mapping.Topic, mapping.Table)
-			m.skippedTables = append(m.skippedTables, mapping)
+			m.skippedTables[mapping.Topic] = mapping
 			continue
 		}
 		if err := m.startTask(mapping); err != nil {
@@ -105,7 +137,11 @@ func (m *TaskManager) StartAll() error {
 
 // startTask creates a new SinkTask, registers it in the manager, and launches it.
 func (m *TaskManager) startTask(mapping TopicTableMapping) error {
-	task, err := NewSinkTask(mapping, m.cfg, m.chConn, m.srClient, m.dlqProducer, m.logger, m.tableColumns[mapping.Table])
+	m.mu.RLock()
+	columns := m.tableColumns[mapping.Table]
+	m.mu.RUnlock()
+
+	task, err := NewSinkTask(mapping, m.cfg, m.chConn, m.srClient, m.dlqProducer, m.logger, columns)
 	if err != nil {
 		return err
 	}
@@ -364,18 +400,23 @@ func (m *TaskManager) Topics() []TopicStatus {
 		result = append(result, TopicStatus{
 			Topic:      mt.mapping.Topic,
 			Table:      mt.mapping.Table,
+			Source:     topicSource(mt.mapping),
+			Pattern:    mt.mapping.SourcePattern,
 			Status:     status,
 			StopReason: stopReason,
 			StopClass:  stopClass,
 			RepairMode: mt.task.GetRepairMode().String(),
 		})
 	}
-	// Topics configured but never started because their table did not validate.
-	// Surfaced as stopped/table_missing so they are visible in the admin API/TUI.
+	// Topics configured or discovered but never started because their table did
+	// not validate. Surfaced as stopped/table_missing so they are visible in the
+	// admin API/TUI.
 	for _, mapping := range m.skippedTables {
 		result = append(result, TopicStatus{
 			Topic:      mapping.Topic,
 			Table:      mapping.Table,
+			Source:     topicSource(mapping),
+			Pattern:    mapping.SourcePattern,
 			Status:     "stopped",
 			StopReason: "table_missing",
 		})
@@ -528,4 +569,5 @@ func RegisterAdminEndpoints(mgr *TaskManager, mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/topics/{topic}/restart", mgr.handleRestartTopic)
 	mux.HandleFunc("POST /api/topics/{topic}/repair", mgr.handleSetRepair)
 	mux.HandleFunc("DELETE /api/topics/{topic}/repair", mgr.handleClearRepair)
+	mux.HandleFunc("POST /api/discovery/run", mgr.handleRunDiscovery)
 }
