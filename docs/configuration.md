@@ -15,7 +15,8 @@ These fields have defaults for local development, but you will always set them e
 | `kafka_brokers` | string | `localhost:9092` | Kafka bootstrap servers (comma-separated). |
 | `clickhouse_dsn` | string | `tcp://localhost:9000` | ClickHouse connection string. Authentication and database are part of the DSN (e.g. `tcp://user:password@host:9000/mydb`). |
 | `group_id` | string | `kahouse` | Base consumer group ID. Each topic gets its own group: `kahouse-<group_id>-<topic>`. |
-| `topic_tables` | list | *(none)* | At least one topic-to-table mapping is required. See [topic_tables](#topic_tables). |
+| `topic_tables` | list | *(none)* | Explicit topic-to-table mappings. See [topic_tables](#topic_tables). At least one `topic_tables` or `topic_patterns` entry is required. |
+| `topic_patterns` | list | *(none)* | Regex-matched topics whose table is derived from the topic name. See [topic_patterns](#topic_patterns). |
 
 ### Format
 
@@ -71,6 +72,33 @@ ClickHouse errors) are never auto-restarted. Configured under the `auto_restart`
 
 A restart re-reads from the last committed Kafka offset; because offsets are committed
 only after a successful write, no data is lost (at-least-once, same as a manual restart).
+
+### Topic discovery
+
+Controls the reconcile loop that expands [`topic_patterns`](#topic_patterns) against the
+Kafka cluster and retries topics parked as `table_missing`. Configured under the
+`topic_discovery` key, plus the top-level `readiness_grace_s`.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `topic_discovery.interval_s` | int | `60` | Seconds between discovery ticks. `0` disables the loop: patterns are still expanded once at startup, and `POST /api/discovery/run` still works. Must be >= 0. |
+| `topic_discovery.max_topics` | int | `200` | Cap on pattern-discovered sink tasks (running or stopped; parked `table_missing` topics do not count). Each task is a full librdkafka consumer with its own prefetch buffer, so this protects the pod's memory from an over-broad pattern. Must be >= 1. |
+| `topic_discovery.timeout_ms` | int | `5000` | Timeout for each Kafka metadata request and ClickHouse `DESCRIBE` issued by a tick. Must be > 0. |
+| `readiness_grace_s` | int | `30` | How long after launch a running task may have no partition assignment before `/readyz` reports it. Joining a consumer group takes a few seconds, and discovered topics spawn tasks at any time. `0` disables the grace. Must be >= 0. |
+
+The loop also re-validates every topic parked as `table_missing`, explicit or discovered,
+and starts it as soon as its table exists. Before this, an explicit topic whose table was
+missing at startup needed a process restart.
+
+Operational notes:
+
+- With `topic_patterns` configured, a process with zero sink tasks is Ready (there may be
+  no matching topic yet). A listing that keeps failing is only visible through
+  `kahouse_discovery_errors_total`, so alert on it.
+- Parked topics are re-validated one `DESCRIBE` at a time, each bounded by `timeout_ms`.
+  If ClickHouse is unreachable, a tick with N parked topics can take up to N x `timeout_ms`;
+  running tasks are unaffected and the next tick simply starts later, but
+  `POST /api/discovery/run` waits for the tick in progress.
 
 ### ClickHouse connection
 
@@ -227,6 +255,66 @@ topic_tables:
     batch_delay_ms: 0       # flush immediately
 ```
 
+## topic_patterns
+
+Each entry matches Kafka topics with a regular expression and derives the ClickHouse
+table from the topic name. kahouse lists the cluster's topics at startup and on every
+[discovery tick](#topic-discovery); each new match gets its own sink task, consumer and
+consumer group (`kahouse-<group_id>-<topic>`), exactly like a `topic_tables` entry, so a
+failure in one discovered topic never affects another.
+
+```yaml
+topic_patterns:
+  - pattern: "prod\\.(?P<domain>[a-z]+)\\.(?P<entity>[a-z_]+)"
+    table: "analytics.${domain}_${entity}"
+    format: json
+    start_at:
+      position: earliest
+```
+
+### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `pattern` | string | RE2 regular expression matched against the whole topic name. Anchors are added automatically, so `events` does not match `events.dlq`. Must be unique across entries. |
+| `table` | string | Table template. `${0}` is the whole topic, `${N}` a numbered capture group, `${name}` a named group (`(?P<name>...)`), `$$` a literal dollar. Every reference is validated at startup; a bare `$name` is rejected. |
+| `table_replace` | map | Optional substring replacements applied to every captured group (including `${0}`) before the template is expanded, e.g. `{".": "_"}`. |
+| *overrides* | | Every [per-topic override](#per-topic-overrides) of `topic_tables` (`format`, `string_value_column`, `batch_size`, `batch_delay_ms`, `max_retries`, `retry_backoff_ms`, `kafka_metadata`, `start_at`, `flatten`) is accepted and applies to every topic the pattern matches. `topic` is not allowed. |
+
+Examples of templates:
+
+| Pattern | Table | Topic | Resulting table |
+|---------|-------|-------|-----------------|
+| `prod\.(?P<d>[a-z]+)\.(?P<e>[a-z_]+)` | `analytics.${d}_${e}` | `prod.hr.employees` | `analytics.hr_employees` |
+| `cdc\.public\.(.+)` | `raw.${1}` | `cdc.public.invoices` | `raw.invoices` |
+| `events\..*` | `raw.${0}` | `events.user.signup` | `raw`.`events.user.signup` |
+| `events\..*` + `table_replace: {".": "_"}` | `raw.${0}` | `events.user.signup` | `raw.events_user_signup` |
+
+Only the first dot of the resulting table name separates database from table; later dots
+stay in the table name and are quoted (see the third row).
+
+### Behavior
+
+- Topics starting with `_` (`__consumer_offsets`, `_schemas`, `_confluent-*`) and topics
+  ending in `dlq_topic_suffix` are never matched.
+- An explicit `topic_tables` entry always wins over a pattern, so a topic that needs its
+  own overrides can be listed explicitly while the pattern covers the rest.
+- When several patterns match a topic, the first one in config order wins and a warning
+  is logged once per topic.
+- A matched topic whose table does not exist is parked as `stopped/table_missing` (visible
+  in `GET /api/topics` with `"source":"pattern"`) and starts automatically on the first
+  tick after the table is created.
+- A discovered topic that is absent from two consecutive successful listings has its task
+  stopped and forgotten; its `kahouse_task_stopped` series is removed. If the topic is
+  re-created it is discovered again. Note that a consumer group whose committed offset is
+  past the new topic's end falls back to `auto_offset_reset`, as in any Kafka client. A
+  failed listing never removes anything.
+- Discovered topics are managed through the same admin API as explicit ones. A discovered
+  topic stopped via `POST /api/topics/{topic}/stop` stays stopped; discovery never respawns
+  a topic it already knows.
+- With `format: avro`, every discovered topic needs its `<topic>-value` subject in the
+  Schema Registry (TopicNameStrategy), as for explicit topics.
+
 ## Full example
 
 ```yaml
@@ -276,6 +364,15 @@ topic_tables:
     format: "string"
     string_value_column: "message"
     max_retries: 0
+
+topic_patterns:
+  - pattern: "prod\\.(?P<domain>[a-z]+)\\.(?P<entity>[a-z_]+)"
+    table: "analytics.${domain}_${entity}"
+    format: "json"
+
+topic_discovery:
+  interval_s: 60
+  max_topics: 200
 ```
 
 ## Validation rules
@@ -292,9 +389,11 @@ kahouse validates the config at startup and exits with an error if any rule is v
 - `batch_size` must be >= 1 (both global and per-topic).
 - `batch_delay_ms`, `max_retries`, `retry_backoff_ms` must be >= 0.
 - `auto_restart.initial_backoff_ms` and `auto_restart.reset_after_s` must be >= 0; `auto_restart.max_backoff_ms` must be >= `initial_backoff_ms`.
-- `topic_tables` must have at least one entry.
+- At least one `topic_tables` or `topic_patterns` entry is required.
 - Each topic must have a non-empty `topic` and `table`.
 - Topic names must be unique -- duplicates are rejected.
+- Each `topic_patterns` entry must have a `pattern` that compiles as RE2 and a `table` template whose `${...}` references all exist in the pattern; bare `$name` is rejected. Patterns must be unique and must not set `topic`. `table_replace` keys must not be empty.
+- `topic_discovery.interval_s` and `readiness_grace_s` must be >= 0; `topic_discovery.max_topics` must be >= 1; `topic_discovery.timeout_ms` must be > 0.
 - `start_at` (when set) must specify exactly one of `position`, `timestamp`/`unix_ms`, or `offsets`.
 - `start_at.position` must be `earliest` or `latest`.
 - `start_at.timestamp` must be RFC3339; `start_at.unix_ms` must be >= 0; the two are mutually exclusive.

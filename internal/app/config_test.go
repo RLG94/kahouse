@@ -27,6 +27,8 @@ func validConfig() Config {
 		MaxRetries:             intPtr(1),
 		RetryBackoffMs:         intPtr(1),
 		ShutdownTimeoutS:       5,
+		ReadinessGraceS:        intPtr(30),
+		TopicDiscovery:         TopicDiscoveryConfig{IntervalS: intPtr(60), MaxTopics: 200, TimeoutMs: 5000},
 		TopicTables:            []TopicTableMapping{{Topic: "orders", Table: "default.orders"}},
 	}
 	for i := range cfg.TopicTables {
