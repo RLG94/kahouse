@@ -108,6 +108,7 @@ create_topics() {
     compose exec -T kafka kafka-topics --bootstrap-server kafka:29092 --create --topic payments --partitions 3 --replication-factor 1 --if-not-exists
     compose exec -T kafka kafka-topics --bootstrap-server kafka:29092 --create --topic logs --partitions 3 --replication-factor 1 --if-not-exists
     compose exec -T kafka kafka-topics --bootstrap-server kafka:29092 --create --topic metadata_test --partitions 1 --replication-factor 1 --if-not-exists
+    compose exec -T kafka kafka-topics --bootstrap-server kafka:29092 --create --topic tombstones_test --partitions 3 --replication-factor 1 --if-not-exists
     register_avro_schemas
     print_status $? "Kafka resources created"
 }
@@ -159,6 +160,7 @@ create_all_tables() {
     compose exec -T clickhouse clickhouse-client --query "CREATE TABLE IF NOT EXISTS default.orders (id Int64, name String, value Float64, timestamp Int64) ENGINE = MergeTree() ORDER BY id SETTINGS index_granularity = 8192"
     compose exec -T clickhouse clickhouse-client --query "CREATE TABLE IF NOT EXISTS default.payments (value String) ENGINE = MergeTree() ORDER BY tuple() SETTINGS index_granularity = 8192"
     compose exec -T clickhouse clickhouse-client --query "CREATE TABLE IF NOT EXISTS default.metadata_test (id Int64, name String, __offset UInt64, __partition UInt32, __topic LowCardinality(String), __timestamp DateTime64(3), __key String, __headers Map(String, String)) ENGINE = MergeTree() ORDER BY (__partition, __offset) SETTINGS index_granularity = 8192"
+    compose exec -T clickhouse clickhouse-client --query "CREATE TABLE IF NOT EXISTS default.tombstones_test (id Int64, name String DEFAULT '', __offset UInt64, _is_deleted UInt8 DEFAULT 0) ENGINE = ReplacingMergeTree(__offset, _is_deleted) ORDER BY id"
     print_status $? "ClickHouse tables created"
 }
 
@@ -364,6 +366,56 @@ run_kafka_metadata_test() {
     print_status 0 "Kafka metadata injection test passed"
 }
 
+run_tombstone_test() {
+    print_info "Running tombstone (row mode) test..."
+    cleanup
+
+    start_base_services
+    create_topics
+    create_all_tables
+
+    compose up -d kahouse
+    wait_for_sink
+
+    # Keyed JSON with NULL marking a null value (a tombstone). Key 2 is deleted,
+    # key 3 deleted and re-created, all within one batch.
+    print_info "Producing inserts, tombstones and a re-created key to tombstones_test..."
+    compose exec -T kafka bash -lc "printf '%s\n' \
+        '1|{\"id\":1,\"name\":\"a\"}' \
+        '2|{\"id\":2,\"name\":\"b\"}' \
+        '3|{\"id\":3,\"name\":\"c\"}' \
+        '2|NULL' \
+        '3|NULL' \
+        '3|{\"id\":3,\"name\":\"c2\"}' \
+        '4|{\"id\":4,\"name\":\"d\"}' \
+        | kafka-console-producer --bootstrap-server localhost:9092 --topic tombstones_test \
+        --property parse.key=true --property key.separator='|' --property null.marker=NULL"
+
+    sleep 10
+
+    local live
+    live=$(compose exec -T clickhouse clickhouse-client --query \
+        "SELECT groupArray(concat(toString(id), ':', name)) FROM (SELECT id, name FROM default.tombstones_test FINAL ORDER BY id)")
+    if [ "$live" = "['1:a','3:c2','4:d']" ]; then
+        print_status 0 "FINAL keeps exactly the live keys: $live"
+    else
+        print_status 1 "FINAL expected ['1:a','3:c2','4:d'], got $live"; exit 1
+    fi
+
+    # Counted from the metric: a background merge may already have dropped the
+    # deletion row of the re-created key 3.
+    local tombstones
+    tombstones=$(compose exec -T kahouse wget -qO- http://localhost:9090/metrics \
+        | awk '/^kahouse_msg_tombstones_total\{topic="tombstones_test"\}/ {print $2}')
+    if [ "$tombstones" = "2" ]; then
+        print_status 0 "kahouse_msg_tombstones_total = 2"
+    else
+        print_status 1 "kahouse_msg_tombstones_total expected 2, got '$tombstones'"; exit 1
+    fi
+
+    print_status 0 "Tombstone test passed"
+}
+
 trap cleanup EXIT
 
 print_info "Cleaning up existing containers..."
@@ -376,6 +428,7 @@ run_mixed_format_success_test
 run_avro_dlq_test
 run_json_dlq_test
 run_kafka_metadata_test
+run_tombstone_test
 
 echo ""
 echo "=== Integration Test Complete ==="
@@ -384,8 +437,9 @@ echo "Summary:"
 echo "  - Success coverage: mixed avro/json/string in one sink run"
 echo "  - DLQ coverage: invalid avro, malformed json (repair mode: dlq)"
 echo "  - Kafka metadata injection: offset/partition/topic/timestamp/key/headers"
-echo "  - Kafka Topics: test, orders, payments, metadata_test"
-echo "  - ClickHouse Tables: default.test, default.orders, default.payments, default.metadata_test"
+echo "  - Tombstones (row mode): deletion rows + ReplacingMergeTree FINAL"
+echo "  - Kafka Topics: test, orders, payments, metadata_test, tombstones_test"
+echo "  - ClickHouse Tables: default.test, default.orders, default.payments, default.metadata_test, default.tombstones_test"
 echo "  - Sink Metrics: docker-compose exec kahouse wget -qO- http://localhost:9090/metrics"
 echo "  - Sink Health: docker-compose exec kahouse wget -qO- http://localhost:9090/readyz"
 echo ""

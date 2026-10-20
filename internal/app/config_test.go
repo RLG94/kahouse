@@ -954,3 +954,74 @@ topic_tables:
 		t.Fatalf("expected nil metadata on second topic, got %+v", cfg.TopicTables[1].KafkaMetadata)
 	}
 }
+
+func TestValidateConfigTombstones(t *testing.T) {
+	rowMapping := func(cfg *Config, tc *TombstoneConfig, offsetCol string) {
+		cfg.TopicTables[0].Tombstones = tc
+		if offsetCol != "" {
+			cfg.TopicTables[0].KafkaMetadata = &KafkaMetadataMapping{Offset: offsetCol}
+		}
+		cfg.TopicTables[0].resolve(cfg)
+	}
+
+	t.Run("nil block keeps the historical skip behavior", func(t *testing.T) {
+		cfg := validConfig()
+		if cfg.TopicTables[0].writesTombstoneRows() {
+			t.Fatal("expected no deletion rows when tombstones is not configured")
+		}
+		if err := validateConfig(&cfg); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("empty block resolves to skip and the default deleted column", func(t *testing.T) {
+		cfg := validConfig()
+		rowMapping(&cfg, &TombstoneConfig{}, "")
+		tc := cfg.TopicTables[0].Tombstones
+		if tc.Mode != TombstoneModeSkip || tc.DeletedColumn != DefaultTombstoneDeletedColumn {
+			t.Fatalf("unexpected defaults: %+v", tc)
+		}
+		if err := validateConfig(&cfg); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("row with key column and offset metadata is valid", func(t *testing.T) {
+		cfg := validConfig()
+		rowMapping(&cfg, &TombstoneConfig{Mode: " Row ", KeyColumn: " id "}, "__offset")
+		if err := validateConfig(&cfg); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.TopicTables[0].writesTombstoneRows() {
+			t.Fatal("expected deletion rows to be enabled")
+		}
+		if got := cfg.TopicTables[0].Tombstones.KeyColumn; got != "id" {
+			t.Fatalf("expected trimmed key_column %q, got %q", "id", got)
+		}
+	})
+
+	cases := []struct {
+		name      string
+		tc        TombstoneConfig
+		offsetCol string
+		wantErr   string
+	}{
+		{"row requires key_column", TombstoneConfig{Mode: "row"}, "__offset", "tombstones.key_column is required"},
+		{"row requires the offset version column", TombstoneConfig{Mode: "row", KeyColumn: "id"}, "", "requires kafka_metadata.offset"},
+		{"deleted column must differ from key", TombstoneConfig{Mode: "row", KeyColumn: "id", DeletedColumn: "id"}, "__offset", "must differ from key_column"},
+		{"unknown mode is rejected", TombstoneConfig{Mode: "delete", KeyColumn: "id"}, "__offset", "tombstones.mode must be one of skip or row"},
+		{"key column clashing with the offset column", TombstoneConfig{Mode: "row", KeyColumn: "__offset"}, "__offset", `tombstones column "__offset" is also kafka_metadata.offset`},
+		{"deleted column clashing with the offset column", TombstoneConfig{Mode: "row", KeyColumn: "id", DeletedColumn: "__offset"}, "__offset", `tombstones column "__offset" is also kafka_metadata.offset`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := validConfig()
+			tc := c.tc
+			rowMapping(&cfg, &tc, c.offsetCol)
+			err := validateConfig(&cfg)
+			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", c.wantErr, err)
+			}
+		})
+	}
+}

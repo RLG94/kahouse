@@ -34,10 +34,59 @@ type TopicTableMapping struct {
 	// matching Kafka Connect's Flatten$Value SMT behavior.
 	Flatten *FlattenConfig `yaml:"flatten,omitempty"`
 
+	// Tombstones optionally configures what a null-value (tombstone) message
+	// does to the target table. Nil means skip, the historical behavior.
+	Tombstones *TombstoneConfig `yaml:"tombstones,omitempty"`
+
 	// SourcePattern is the topic_patterns entry that produced this mapping, or
 	// empty for an explicit topic_tables entry. It is set by TopicPattern.expand,
 	// never from YAML.
 	SourcePattern string `yaml:"-"`
+}
+
+// Tombstone modes.
+const (
+	// TombstoneModeSkip commits the offset and ignores the message. The row a
+	// compacted topic deleted stays in ClickHouse.
+	TombstoneModeSkip = "skip"
+	// TombstoneModeRow writes the tombstone as a regular row carrying the key
+	// and DeletedColumn = 1. With a ReplacingMergeTree(<offset>, <deleted>)
+	// table read with FINAL, the key disappears. Append-only: the commit path
+	// is the same as for any other message.
+	TombstoneModeRow = "row"
+)
+
+// DefaultTombstoneDeletedColumn is the is_deleted column ReplacingMergeTree
+// reads when no deleted_column is configured.
+const DefaultTombstoneDeletedColumn = "_is_deleted"
+
+// TombstoneConfig configures how a sink task treats Kafka tombstones (records
+// with a key and a null value), the deletion marker of compacted topics.
+type TombstoneConfig struct {
+	Mode          string `yaml:"mode,omitempty"`
+	KeyColumn     string `yaml:"key_column,omitempty"`
+	DeletedColumn string `yaml:"deleted_column,omitempty"`
+}
+
+// resolveDefaults fills zero-value fields: skip, trimmed names, _is_deleted.
+func (t *TombstoneConfig) resolveDefaults() {
+	if t == nil {
+		return
+	}
+	t.Mode = strings.ToLower(strings.TrimSpace(t.Mode))
+	if t.Mode == "" {
+		t.Mode = TombstoneModeSkip
+	}
+	t.KeyColumn = strings.TrimSpace(t.KeyColumn)
+	t.DeletedColumn = strings.TrimSpace(t.DeletedColumn)
+	if t.DeletedColumn == "" {
+		t.DeletedColumn = DefaultTombstoneDeletedColumn
+	}
+}
+
+// writesTombstoneRows reports whether tombstones become deletion rows.
+func (m *TopicTableMapping) writesTombstoneRows() bool {
+	return m.Tombstones != nil && m.Tombstones.Mode == TombstoneModeRow
 }
 
 // FlattenConfig configures optional JSON object flattening before insertion.
@@ -267,6 +316,9 @@ func (m *TopicTableMapping) resolve(cfg *Config) {
 	}
 	if m.Flatten != nil {
 		m.Flatten.resolveDefaults()
+	}
+	if m.Tombstones != nil {
+		m.Tombstones.resolveDefaults()
 	}
 }
 
@@ -581,6 +633,34 @@ func validateMapping(tt *TopicTableMapping) error {
 		}
 		if tt.Flatten.MaxDepth < 0 {
 			return fmt.Errorf("flatten.max_depth must be >= 0, got %d", tt.Flatten.MaxDepth)
+		}
+	}
+	if tt.Tombstones != nil {
+		switch tt.Tombstones.Mode {
+		case TombstoneModeSkip, TombstoneModeRow:
+		default:
+			return fmt.Errorf("tombstones.mode must be one of skip or row, got %q", tt.Tombstones.Mode)
+		}
+		if tt.Tombstones.Mode == TombstoneModeRow {
+			if tt.Tombstones.KeyColumn == "" {
+				return fmt.Errorf("tombstones.key_column is required when tombstones.mode is row")
+			}
+			if tt.Tombstones.DeletedColumn == tt.Tombstones.KeyColumn {
+				return fmt.Errorf("tombstones.deleted_column must differ from key_column")
+			}
+			// The version column of the ReplacingMergeTree is what lets the
+			// deletion row win over the insert it deletes, and a re-created
+			// key win over the deletion. Without it the outcome is undefined.
+			if tt.KafkaMetadata == nil || tt.KafkaMetadata.Offset == "" {
+				return fmt.Errorf("tombstones.mode row requires kafka_metadata.offset (the ReplacingMergeTree version column)")
+			}
+			// Metadata is injected after the deletion row is built and would
+			// overwrite the key or the deleted flag.
+			for _, f := range tt.KafkaMetadata.fields() {
+				if f.column == tt.Tombstones.KeyColumn || f.column == tt.Tombstones.DeletedColumn {
+					return fmt.Errorf("tombstones column %q is also kafka_metadata.%s", f.column, f.name)
+				}
+			}
 		}
 	}
 	return nil

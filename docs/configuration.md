@@ -159,6 +159,7 @@ Every field below is optional. When omitted, the value is inherited from the cor
 | `max_retries` | int | `max_retries` |
 | `retry_backoff_ms` | int | `retry_backoff_ms` |
 | `kafka_metadata` | object | *(none — opt-in, see below)* |
+| `tombstones` | object | *(none — opt-in, see below)* |
 
 ### kafka_metadata
 
@@ -279,7 +280,7 @@ topic_patterns:
 | `pattern` | string | RE2 regular expression matched against the whole topic name. Anchors are added automatically, so `events` does not match `events.dlq`. Must be unique across entries. |
 | `table` | string | Table template. `${0}` is the whole topic, `${N}` a numbered capture group, `${name}` a named group (`(?P<name>...)`), `$$` a literal dollar. Every reference is validated at startup; a bare `$name` is rejected. |
 | `table_replace` | map | Optional substring replacements applied to every captured group (including `${0}`) before the template is expanded, e.g. `{".": "_"}`. |
-| *overrides* | | Every [per-topic override](#per-topic-overrides) of `topic_tables` (`format`, `string_value_column`, `batch_size`, `batch_delay_ms`, `max_retries`, `retry_backoff_ms`, `kafka_metadata`, `start_at`, `flatten`) is accepted and applies to every topic the pattern matches. `topic` is not allowed. |
+| *overrides* | | Every [per-topic override](#per-topic-overrides) of `topic_tables` (`format`, `string_value_column`, `batch_size`, `batch_delay_ms`, `max_retries`, `retry_backoff_ms`, `kafka_metadata`, `start_at`, `flatten`, `tombstones`) is accepted and applies to every topic the pattern matches. `topic` is not allowed. |
 
 Examples of templates:
 
@@ -400,6 +401,93 @@ kahouse validates the config at startup and exits with an error if any rule is v
 - `start_at.offsets` keys (partitions) and values (offsets) must be >= 0.
 - Within a single topic's `kafka_metadata` block, column names must be unique across the six subfields.
 - `flatten` (when enabled) requires `format: json`; `delimiter` must not be empty; `max_depth` must be >= 0.
+- `tombstones.mode` must be `skip` or `row`; `row` requires `key_column`, a `deleted_column` different from it, and `kafka_metadata.offset`. Neither `key_column` nor `deleted_column` may also be a `kafka_metadata` column.
+
+#### Tombstones (`tombstones`)
+
+A tombstone is a Kafka record with a key and a null value: the deletion marker
+of a compacted topic. By default kahouse commits its offset and skips it, so a
+row deleted upstream stays in ClickHouse. `tombstones.mode: row` writes it as a
+regular **deletion row** instead, and a `ReplacingMergeTree` table turns that
+row into a deletion when read with `FINAL`.
+
+```yaml
+topic_tables:
+  - topic: "teams.snapshots.v1"
+    table: "default.teams_snapshots"
+    kafka_metadata:
+      offset: "__offset"        # required: the ReplacingMergeTree version
+    tombstones:
+      mode: row                 # skip (default) | row
+      key_column: id            # column the message key is written to
+      deleted_column: _is_deleted  # default _is_deleted, must be UInt8
+```
+
+```sql
+CREATE TABLE default.teams_snapshots (
+    id          Int64,
+    name        String,
+    __offset    UInt64,
+    _is_deleted UInt8
+) ENGINE = ReplacingMergeTree(__offset, _is_deleted)
+ORDER BY id;
+
+SELECT * FROM default.teams_snapshots FINAL;   -- deleted keys are gone
+```
+
+| Subfield | Type | Default | Description |
+|----------|------|---------|-------------|
+| `mode` | string | `skip` | `skip` ignores tombstones (historical behavior). `row` writes `{key_column: <key>, deleted_column: 1}`. |
+| `key_column` | string | *(none)* | Required with `row`. The column the message key is written to. Supported types: `String`, `FixedString(N)`, `UUID`, `(U)Int8` to `(U)Int64`, optionally wrapped in `Nullable` or `LowCardinality`. |
+| `deleted_column` | string | `_is_deleted` | Must exist in the table as `UInt8`. Data rows leave it out and get its default, `0`. |
+
+How `row` behaves:
+
+- The deletion row joins the batch like any other message, so it follows the
+  same write-then-commit path: its offset is committed only once it is in
+  ClickHouse. Re-delivery writes the same row again, which the version column
+  makes harmless.
+- Only a null value is a tombstone. An empty but non-null value is data and
+  goes through the decoder as before.
+- `kafka_metadata.offset` is required and should be the `ReplacingMergeTree`
+  version: a key's deletion row then wins over the insert it deletes, and a
+  key re-created later wins over the deletion. Offsets only grow within a
+  partition, so this holds while every message of a key lands in the same
+  partition, which the default partitioner guarantees for a fixed partition
+  count. **Adding partitions to the topic breaks it**: a key moved to a new
+  partition gets lower offsets than its old rows, and `FINAL` can keep a stale
+  row or hide a live one. Rebuild the table after repartitioning.
+- The table must be a `ReplacingMergeTree` (or a replicated or shared variant)
+  with the offset as version and `deleted_column` as `is_deleted`, which needs
+  ClickHouse 23.2 or later. Its `ORDER BY` must be exactly `key_column`, and
+  `PARTITION BY`, if any, must not use other columns: a deletion row carries
+  only the key, so with `ORDER BY (company_id, id)` it would never replace the
+  row it deletes. kahouse does not check the engine or the keys: on a wrong
+  table, deletion rows are plain rows and nothing fails.
+- Deletion rows and data rows are written in two separate `INSERT`s per flush,
+  so the columns a deletion row leaves out get their table defaults. Use
+  non-Nullable columns with defaults, or `Nullable`, for every column but the
+  key, the deleted flag and the offset.
+- Bulk deletions upstream cost the same as bulk inserts: they are batched rows,
+  not mutations.
+- The key is read as plain text (UTF-8), as Kafka Connect's `StringConverter`
+  would. Binary keys (Avro, Kafka's `LongSerializer`) are not supported, and a
+  structured key such as `{"id":1}` must not be paired with a `String`
+  `key_column`: it would be stored as that literal text and delete nothing. A tombstone without a key, or whose key does not fit `key_column`
+  (not a number, out of range, negative for an unsigned column, not a UUID,
+  longer than a `FixedString`), is a decode error handled by the repair mode.
+  In the default strict mode that stops the topic, where `skip` used to ignore
+  it.
+- Before a topic starts, kahouse checks that the table has `key_column` with a
+  supported type, `deleted_column` as `UInt8`, and the offset column. A table
+  that fails the check is handled like a missing table: the topic is parked as
+  `table_missing` and retried on every discovery tick, so an `ALTER TABLE`
+  starts it without a restart. Other topics are not affected.
+- `tombstones` is also accepted on a [`topic_patterns`](#topic_patterns) entry and
+  applies to every topic the pattern discovers; each discovered table must then
+  have the columns above.
+
+Deletion rows are counted in `kahouse_msg_tombstones_total` once their batch is written.
 
 #### Per-topic JSON flattening (`flatten`)
 

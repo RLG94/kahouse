@@ -190,6 +190,9 @@ func NewSinkTask(
 	if err != nil {
 		return nil, fmt.Errorf("failed to create decoder for topic %s: %w", mapping.Topic, err)
 	}
+	if err := validateTombstoneColumns(mapping, columnInfo); err != nil {
+		return nil, fmt.Errorf("topic %s: %w", mapping.Topic, err)
+	}
 
 	// Each topic gets a unique consumer group for full offset isolation.
 	groupID := "kahouse-" + strings.TrimSpace(cfg.GroupID) + "-" + mapping.Topic
@@ -352,8 +355,10 @@ func (t *SinkTask) Run(ctx context.Context) {
 		msgConsumed.WithLabelValues(topic).Inc()
 		observeReceiveLag(topic, msg, time.Now())
 
-		// Tombstone (null-value) message: commit offset and skip.
-		if len(msg.Value) == 0 {
+		isTombstone := isRowTombstone(msg.Value, &t.mapping)
+
+		// Tombstone (null-value) message, skip mode: commit offset and skip.
+		if len(msg.Value) == 0 && !t.mapping.writesTombstoneRows() {
 			t.sugar.Warn("Received tombstone message (nil value), committing offset and skipping")
 			if _, commitErr := t.consumer.CommitMessage(msg); commitErr != nil {
 				t.sugar.Errorf("Failed to commit offset after tombstone: %v", commitErr)
@@ -363,7 +368,15 @@ func (t *SinkTask) Run(ctx context.Context) {
 			continue
 		}
 
-		record, err := t.decoder.Decode(*msg.TopicPartition.Topic, msg.Value)
+		// Row mode: the tombstone joins the batch as a deletion row and rides the
+		// same write-then-commit path as any other message, so it cannot be
+		// committed before it lands.
+		var record map[string]interface{}
+		if isTombstone {
+			record, err = tombstoneRecord(msg.Key, *t.mapping.Tombstones, t.columnInfo)
+		} else {
+			record, err = t.decoder.Decode(*msg.TopicPartition.Topic, msg.Value)
+		}
 		if err != nil {
 			t.sugar.Errorf("Failed to decode message: %v", err)
 			msgFailed.WithLabelValues(topic).Inc()
@@ -395,7 +408,7 @@ func (t *SinkTask) Run(ctx context.Context) {
 		}
 
 		// Apply optional per-topic JSON flattening (Kafka Connect Flatten$Value parity).
-		if fc := t.mapping.Flatten; fc != nil && fc.Enabled {
+		if fc := t.mapping.Flatten; fc != nil && fc.Enabled && !isTombstone {
 			record = flattenRecord(record, fc.Delimiter, fc.MaxDepth, *fc.PreserveArrays)
 		}
 
@@ -430,7 +443,7 @@ func (t *SinkTask) flush(ctx context.Context, table string, batch []map[string]i
 	defer flushCancel()
 
 	writeStart := time.Now()
-	attempts, timing, writeErr := t.writeWithRetries(flushCtx, table, batch)
+	attempts, timing, writeErr := t.writeBatchParts(flushCtx, table, batch)
 	writeDuration := time.Since(writeStart)
 
 	processLatency.WithLabelValues(topic).Observe(writeDuration.Seconds())
@@ -456,6 +469,10 @@ func (t *SinkTask) flush(ctx context.Context, table string, batch []map[string]i
 	}
 
 	msgProduced.WithLabelValues(topic).Add(float64(len(batch)))
+	if t.mapping.writesTombstoneRows() {
+		_, tombstones := splitTombstoneRows(batch, t.mapping.Tombstones.DeletedColumn)
+		msgTombstones.WithLabelValues(topic).Add(float64(len(tombstones)))
+	}
 
 	// Commit the consumer's current position. Since no read-ahead happens,
 	// this commits exactly the offsets of the messages in this batch.
@@ -491,6 +508,33 @@ func (t *SinkTask) flush(ctx context.Context, table string, batch []map[string]i
 		"commit_ms", commitDuration.Milliseconds(),
 	)
 	return true
+}
+
+// writeBatchParts writes the batch, splitting deletion rows into their own
+// INSERT in tombstone row mode (see splitTombstoneRows). A failure on either
+// part fails the whole flush: the offsets stay uncommitted and the batch is
+// re-delivered, which the ReplacingMergeTree version makes idempotent.
+func (t *SinkTask) writeBatchParts(ctx context.Context, table string, batch []map[string]interface{}) (int, batchTiming, error) {
+	if !t.mapping.writesTombstoneRows() {
+		return t.writeWithRetries(ctx, table, batch)
+	}
+	data, tombstones := splitTombstoneRows(batch, t.mapping.Tombstones.DeletedColumn)
+	attempts := 0
+	var timing batchTiming
+	for _, part := range [][]map[string]interface{}{data, tombstones} {
+		if len(part) == 0 {
+			continue
+		}
+		n, partTiming, err := t.writeWithRetries(ctx, table, part)
+		attempts += n
+		timing.Prepare += partTiming.Prepare
+		timing.Append += partTiming.Append
+		timing.Send += partTiming.Send
+		if err != nil {
+			return attempts, timing, err
+		}
+	}
+	return attempts, timing, nil
 }
 
 // classifyWriteError maps a final batch-write error to a StopClass. A flush that

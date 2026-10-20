@@ -117,6 +117,15 @@ topic_tables:
     #     0: 12345
     #     1: 9000
 
+  # Tombstones (optional, per-topic). A key + null value message is the deletion
+  # marker of a compacted topic. Default is skip (commit and ignore); row writes
+  # {key_column: <key>, deleted_column: 1} so a ReplacingMergeTree(<offset>,
+  # <deleted>) table read with FINAL drops the key. Requires kafka_metadata.offset.
+  # tombstones:
+  #   mode: row               # skip | row
+  #   key_column: id
+  #   deleted_column: _is_deleted
+
   # Kafka metadata injection (optional, per-topic).
   # Adds Kafka message metadata as extra columns on each row before insert.
   # Equivalent to Kafka Connect's InsertField$Value SMT. Each field is optional:

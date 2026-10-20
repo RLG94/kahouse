@@ -156,7 +156,7 @@ func (m *TaskManager) reconcilePatterns(ctx context.Context, topics []string, re
 			m.logger.Warnf("discovery: topic_discovery.max_topics (%d) reached; not starting %s or any other new matching topic", m.cfg.TopicDiscovery.MaxTopics, mapping.Topic)
 			break
 		}
-		cols, err := m.describeWithTimeout(ctx, mapping.Table)
+		cols, err := m.describeWithTimeout(ctx, mapping)
 		if err != nil {
 			m.mu.Lock()
 			m.skippedTables[mapping.Topic] = mapping
@@ -214,17 +214,21 @@ func (m *TaskManager) patternCapacityLeft() bool {
 	return n < m.cfg.TopicDiscovery.MaxTopics
 }
 
-// describeWithTimeout fetches the table's columns, treating a table without
-// columns as missing (as validateTables does).
-func (m *TaskManager) describeWithTimeout(ctx context.Context, table string) (ColumnInfo, error) {
+// describeWithTimeout fetches the mapping's table columns, treating a table
+// without columns as missing and a table without the tombstone columns as not
+// valid (as validateTables does).
+func (m *TaskManager) describeWithTimeout(ctx context.Context, mapping TopicTableMapping) (ColumnInfo, error) {
 	descCtx, cancel := context.WithTimeout(ctx, m.discoveryTimeout())
 	defer cancel()
-	cols, err := m.describeTable(descCtx, table)
+	cols, err := m.describeTable(descCtx, mapping.Table)
 	if err != nil {
 		return nil, err
 	}
 	if len(cols) == 0 {
-		return nil, fmt.Errorf("table %q has no columns or does not exist", table)
+		return nil, fmt.Errorf("table %q has no columns or does not exist", mapping.Table)
+	}
+	if err := validateTombstoneColumns(mapping, cols); err != nil {
+		return nil, err
 	}
 	return cols, nil
 }
@@ -262,7 +266,7 @@ func (m *TaskManager) retryMissingTables(ctx context.Context, res *DiscoveryResu
 		if ctx.Err() != nil || m.parentCtx.Err() != nil {
 			return
 		}
-		cols, err := m.describeWithTimeout(ctx, mapping.Table)
+		cols, err := m.describeWithTimeout(ctx, mapping)
 		if err != nil {
 			continue // still missing; stays parked without re-logging every tick
 		}

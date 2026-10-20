@@ -145,6 +145,23 @@ topic_tables:
 
 On collision with an existing record key, the metadata value wins and a warning is logged once per column. See [`docs/examples/kafka-metadata.yaml`](docs/examples/kafka-metadata.yaml) for a standalone example.
 
+### Tombstones (compacted topics)
+
+A tombstone (key + null value) is skipped by default, so a row deleted upstream stays in ClickHouse. Per topic (or per `topic_patterns` entry), `tombstones.mode: row` writes it as a deletion row (`key_column` = key, `_is_deleted` = 1) in the same batch as everything else, so it follows the normal write-then-commit path. Pair it with a `ReplacingMergeTree(__offset, _is_deleted)` table and read with `FINAL`:
+
+```yaml
+topic_tables:
+  - topic: "teams.snapshots.v1"
+    table: "default.teams_snapshots"
+    kafka_metadata:
+      offset: "__offset"
+    tombstones:
+      mode: row
+      key_column: id
+```
+
+See [docs/configuration.md](docs/configuration.md#tombstones-tombstones) for the table definition and details.
+
 ## Error handling
 
 Write failures are retried with exponential backoff. If all retries are exhausted, the task stops. Since Kafka retains messages, restarting the task replays from the last committed offset.
@@ -251,6 +268,7 @@ All metrics are labeled by `topic`, except the discovery metrics, which are labe
 | `kahouse_msg_produced_total` | Counter | Messages written to ClickHouse |
 | `kahouse_msg_failed_total` | Counter | Deserialization errors + write failures |
 | `kahouse_msg_dlq_total` | Counter | Messages forwarded to DLQ |
+| `kahouse_msg_tombstones_total` | Counter | Tombstones written as deletion rows (`tombstones.mode: row`) |
 | `kahouse_task_stopped` | Gauge | 1 = stopped, 0 = running |
 | `kahouse_task_restarts_total` | Counter | Admin API restarts |
 | `kahouse_task_auto_restarts_total` | Counter | Supervisor auto-restarts of transiently-crashed tasks |

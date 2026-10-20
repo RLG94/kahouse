@@ -95,6 +95,24 @@ func TestValidateConfigTopicPatterns(t *testing.T) {
 			want: "topic_patterns[0]: batch_size must be at least 1",
 		},
 		{
+			name: "tombstones row mode on a pattern",
+			mutate: func(cfg *Config) {
+				p := validPattern()
+				p.KafkaMetadata = &KafkaMetadataMapping{Offset: "__offset"}
+				p.Tombstones = &TombstoneConfig{Mode: TombstoneModeRow, KeyColumn: "id"}
+				withPattern(cfg, p)
+			},
+		},
+		{
+			name: "tombstones row mode on a pattern without the offset column",
+			mutate: func(cfg *Config) {
+				p := validPattern()
+				p.Tombstones = &TombstoneConfig{Mode: TombstoneModeRow, KeyColumn: "id"}
+				withPattern(cfg, p)
+			},
+			want: "topic_patterns[0]: tombstones.mode row requires kafka_metadata.offset",
+		},
+		{
 			name: "patterns alone satisfy the mapping requirement",
 			mutate: func(cfg *Config) {
 				cfg.TopicTables = nil

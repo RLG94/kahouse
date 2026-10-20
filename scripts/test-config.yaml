@@ -33,3 +33,11 @@ topic_tables:
       timestamp: "__timestamp"
       key:       "__key"
       headers:   "__headers"
+  - topic: "tombstones_test"
+    table: "default.tombstones_test"
+    format: "json"
+    kafka_metadata:
+      offset: "__offset"
+    tombstones:
+      mode: row
+      key_column: id

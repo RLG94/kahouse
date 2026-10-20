@@ -123,8 +123,14 @@ func NewTaskManager(
 // StartAll launches a SinkTask for every topic-table mapping in the config.
 func (m *TaskManager) StartAll() error {
 	for _, mapping := range m.cfg.TopicTables {
-		if _, ok := m.tableColumns[mapping.Table]; !ok {
+		cols, ok := m.tableColumns[mapping.Table]
+		if !ok {
 			m.logger.Warnf("Skipping sink task for topic %s: table %q did not validate", mapping.Topic, mapping.Table)
+			m.skippedTables[mapping.Topic] = mapping
+			continue
+		}
+		if err := validateTombstoneColumns(mapping, cols); err != nil {
+			m.logger.Warnf("Skipping sink task for topic %s: table %q did not validate: %v; parked as table_missing and retried every discovery tick", mapping.Topic, mapping.Table, err)
 			m.skippedTables[mapping.Topic] = mapping
 			continue
 		}

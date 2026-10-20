@@ -29,6 +29,11 @@ var (
 		Name:      "msg_dlq_total",
 		Help:      "Total number of messages sent to the dead letter queue",
 	}, []string{"topic"})
+	msgTombstones = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "kahouse",
+		Name:      "msg_tombstones_total",
+		Help:      "Total number of tombstones written as deletion rows (tombstones.mode: row)",
+	}, []string{"topic"})
 	batchSizeHist = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: "kahouse",
 		Name:      "batch_size",
@@ -108,6 +113,7 @@ func init() {
 		msgProduced,
 		msgFailed,
 		msgDLQ,
+		msgTombstones,
 		batchSizeHist,
 		batchDelayHist,
 		processLatency,

@@ -289,6 +289,49 @@ func TestReconcileParksMissingTableThenStarts(t *testing.T) {
 	}
 }
 
+func TestReconcileParksTableWithoutTombstoneColumns(t *testing.T) {
+	p := hrPattern()
+	p.KafkaMetadata = &KafkaMetadataMapping{Offset: "__offset"}
+	p.Tombstones = &TombstoneConfig{Mode: TombstoneModeRow, KeyColumn: "id"}
+	f := newDiscoveryFixture(t, nil, p)
+	f.lister.set("prod.hr.employees")
+	f.tables.tables["analytics.hr_employees"] = ColumnInfo{"id": "Int64", "__offset": "UInt64"}
+
+	res := f.mgr.Reconcile(context.Background())
+	assertStrings(t, "TableMissing", res.TableMissing, []string{"prod.hr.employees"})
+	if st := f.status(t, "prod.hr.employees"); st.StopReason != "table_missing" {
+		t.Fatalf("Expected a table without _is_deleted to be parked, got %+v", st)
+	}
+
+	// The column is added: the next tick starts the topic, no restart needed.
+	f.tables.mu.Lock()
+	f.tables.tables["analytics.hr_employees"]["_is_deleted"] = "UInt8"
+	f.tables.mu.Unlock()
+	res = f.mgr.Reconcile(context.Background())
+	assertStrings(t, "Started", res.Started, []string{"prod.hr.employees"})
+}
+
+func TestStartAllParksExplicitTableWithoutTombstoneColumns(t *testing.T) {
+	cfg := &Config{
+		InputFormat: "json",
+		TopicTables: []TopicTableMapping{{
+			Topic:         "teams",
+			Table:         "default.teams",
+			KafkaMetadata: &KafkaMetadataMapping{Offset: "__offset"},
+			Tombstones:    &TombstoneConfig{Mode: TombstoneModeRow, KeyColumn: "id"},
+		}},
+	}
+	f := newDiscoveryFixture(t, cfg)
+	f.mgr.tableColumns["default.teams"] = ColumnInfo{"id": "Int64", "__offset": "UInt64"}
+
+	if err := f.mgr.StartAll(); err != nil {
+		t.Fatalf("A misconfigured table must park its topic, not fail startup: %v", err)
+	}
+	if st := f.status(t, "teams"); st.StopReason != "table_missing" || st.Source != "config" {
+		t.Fatalf("Expected teams parked as config/table_missing, got %+v", st)
+	}
+}
+
 func TestReconcileRetriesExplicitMissingTables(t *testing.T) {
 	cfg := &Config{
 		InputFormat: "json",

@@ -5,6 +5,7 @@ go 1.24.3
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.44.0
 	github.com/confluentinc/confluent-kafka-go/v2 v2.14.0
+	github.com/google/uuid v1.6.0
 	github.com/linkedin/goavro/v2 v2.15.0
 	github.com/prometheus/client_golang v1.23.2
 	go.uber.org/zap v1.27.1
@@ -25,7 +26,6 @@ require (
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
 	github.com/golang-jwt/jwt/v5 v5.2.1 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/klauspost/compress v1.18.3 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/moby/sys/atomicwriter v0.1.0 // indirect

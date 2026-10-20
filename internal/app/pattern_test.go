@@ -132,6 +132,33 @@ func TestTopicPatternExpand(t *testing.T) {
 	}
 }
 
+func TestTopicPatternExpandCarriesTombstones(t *testing.T) {
+	p := TopicPattern{
+		Pattern: `prod\.(?P<domain>[a-z]+)\.snapshots`,
+		TopicTableMapping: TopicTableMapping{
+			Table:         "analytics.${domain}_snapshots",
+			KafkaMetadata: &KafkaMetadataMapping{Offset: "__offset"},
+			Tombstones:    &TombstoneConfig{Mode: " row ", KeyColumn: "id"},
+		},
+	}
+	cfg := validConfig()
+	p.resolve(&cfg)
+	if err := p.compile(); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	m, ok := p.expand("prod.teams.snapshots")
+	if !ok {
+		t.Fatal("Expected prod.teams.snapshots to match")
+	}
+	if !m.writesTombstoneRows() {
+		t.Fatalf("Expected the discovered topic to write deletion rows, got %+v", m.Tombstones)
+	}
+	if m.Tombstones.KeyColumn != "id" || m.Tombstones.DeletedColumn != DefaultTombstoneDeletedColumn {
+		t.Errorf("Expected resolved tombstones config, got %+v", m.Tombstones)
+	}
+}
+
 func TestTopicPatternExpandTemplateForms(t *testing.T) {
 	tests := []struct {
 		name    string
