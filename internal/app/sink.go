@@ -360,7 +360,7 @@ func (t *SinkTask) Run(ctx context.Context) {
 		// Tombstone (null-value) message, skip mode: commit offset and skip.
 		if len(msg.Value) == 0 && !t.mapping.writesTombstoneRows() {
 			t.sugar.Warn("Received tombstone message (nil value), committing offset and skipping")
-			if _, commitErr := t.consumer.CommitMessage(msg); commitErr != nil {
+			if commitErr := t.commitSkipped(msg, len(batch)); commitErr != nil {
 				t.sugar.Errorf("Failed to commit offset after tombstone: %v", commitErr)
 				t.setStopClass(StopClassTransient)
 				return
@@ -399,7 +399,7 @@ func (t *SinkTask) Run(ctx context.Context) {
 					msg.TopicPartition.Partition, msg.TopicPartition.Offset)
 			}
 
-			if _, commitErr := t.consumer.CommitMessage(msg); commitErr != nil {
+			if commitErr := t.commitSkipped(msg, len(batch)); commitErr != nil {
 				t.sugar.Errorf("Failed to commit offset after decode error: %v", commitErr)
 				t.setStopClass(StopClassTransient)
 				return
@@ -427,6 +427,19 @@ func (t *SinkTask) Run(ctx context.Context) {
 			firstInBatch = time.Time{}
 		}
 	}
+}
+
+// commitSkipped commits past a message that is not written to ClickHouse. With
+// rows still pending in the batch it commits nothing: CommitMessage commits the
+// partition up to msg, which would cover pending rows before they are written,
+// and a crash before the flush would lose them. The next flush's Commit covers
+// msg anyway, since the consumer stores the offset of every message it reads.
+func (t *SinkTask) commitSkipped(msg *kafka.Message, pending int) error {
+	if pending > 0 {
+		return nil
+	}
+	_, err := t.consumer.CommitMessage(msg)
+	return err
 }
 
 // flush writes the batch to ClickHouse with retries and commits offsets.
@@ -475,7 +488,8 @@ func (t *SinkTask) flush(ctx context.Context, table string, batch []map[string]i
 	}
 
 	// Commit the consumer's current position. Since no read-ahead happens,
-	// this commits exactly the offsets of the messages in this batch.
+	// this commits the offsets of the messages in this batch and of any
+	// message skipped since the last flush (see commitSkipped).
 	// If the commit fails (e.g. after a rebalance clears stored offsets),
 	// we log a warning but do NOT stop the task: the data was already written
 	// to ClickHouse, and the consumer will keep reading from its current

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 )
 
 func TestStopClassString(t *testing.T) {
@@ -45,5 +46,15 @@ func TestClassifyWriteError(t *testing.T) {
 				t.Fatalf("classifyWriteError(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestCommitSkippedLeavesPendingBatchToFlush(t *testing.T) {
+	// With rows pending, committing the skipped message would commit past them.
+	// The task has no consumer: any commit attempt would panic.
+	topic := "teams"
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: 0, Offset: 7}}
+	if err := (&SinkTask{}).commitSkipped(msg, 1); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
